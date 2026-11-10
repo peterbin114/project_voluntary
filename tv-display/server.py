@@ -1,11 +1,14 @@
-"""Minimal HTTP API for Arduino meal-sequence updates.
+"""HTTP server for Arduino meal-sequence updates and live TV pages.
 
 Run with: python server.py
-The server listens on all network interfaces at port 8000.
+Open http://SERVER_IP:8000/?classroom=1-2 on a TV browser.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Lock
+from urllib.parse import parse_qs, urlsplit
+
+from app import TV_CLASSROOM, class_name, render_page
 
 HOST = "0.0.0.0"
 PORT = 8000
@@ -27,21 +30,120 @@ def current_state():
         }
 
 
+LIVE_UPDATE_SCRIPT = """
+<script>
+  const classroomCode = __CLASSROOM_CODE__;
+  const connectionLabel = document.querySelector("#connection-label");
+  const messageElement = document.querySelector(".message");
+  const statusElement = document.querySelector(".status");
+  const iconElement = document.querySelector(".status-symbol");
+  const statusTextElement = statusElement.querySelector("span:last-child");
+  const footerElement = document.querySelector("footer > span:first-child");
+
+  function applyMealState(state) {
+    let display;
+    if (state.current_class === classroomCode) {
+      display = {
+        message: "지금 급식 시간!",
+        status: "current",
+        icon: "●",
+        text: "급식실로 이동하세요.",
+        footer: "차례를 지켜 안전하게 이동해주세요."
+      };
+    } else if (state.next_class === classroomCode) {
+      display = {
+        message: "다음 순서입니다",
+        status: "next",
+        icon: "⏱",
+        text: "준비해주세요.",
+        footer: "안전하게 이동하고 맛있게 식사하세요."
+      };
+    } else if (state.current_class === null) {
+      display = {
+        message: "급식 시작 전",
+        status: "waiting",
+        icon: "✓",
+        text: "다음 순서: " + state.next_class.replace("-", "학년 ") + "반",
+        footer: "안내가 바뀔 때까지 교실에서 기다려주세요."
+      };
+    } else {
+      display = {
+        message: "현재 대기 중",
+        status: "waiting",
+        icon: "✓",
+        text: "현재 " + state.current_class.replace("-", "학년 ") + "반 급식 중",
+        footer: "안내가 바뀔 때까지 교실에서 기다려주세요."
+      };
+    }
+
+    messageElement.textContent = display.message;
+    statusElement.className = "status " + display.status;
+    iconElement.textContent = display.icon;
+    statusTextElement.textContent = display.text;
+    footerElement.textContent = display.footer;
+  }
+
+  async function refreshMealState() {
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      applyMealState(await response.json());
+      connectionLabel.textContent = "서버 연결됨";
+    } catch (error) {
+      connectionLabel.textContent = "서버 연결 끊김";
+    } finally {
+      window.setTimeout(refreshMealState, 2000);
+    }
+  }
+
+  refreshMealState();
+</script>
+"""
+
+
 class MealApiHandler(BaseHTTPRequestHandler):
-    def _send_json(self, status, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def _send_bytes(self, status, content_type, body):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(status, "application/json; charset=utf-8", body)
+
     def do_GET(self):
-        if self.path != "/api/state":
+        request = urlsplit(self.path)
+        if request.path == "/api/state":
+            self._send_json(200, current_state())
+            return
+
+        if request.path != "/":
             self._send_json(404, {"error": "not_found"})
             return
-        self._send_json(200, current_state())
+
+        query = parse_qs(request.query)
+        classroom = query.get("classroom", [TV_CLASSROOM])[0]
+        try:
+            class_name(classroom)
+            state = current_state()
+            page = render_page(
+                tv_classroom=classroom,
+                current_class=state["current_class"],
+                next_class=state["next_class"],
+            )
+        except ValueError as error:
+            self._send_json(400, {"error": str(error)})
+            return
+
+        page = page.replace("교실 안내 화면", '<span id="connection-label">서버 연결 중</span>')
+        live_script = LIVE_UPDATE_SCRIPT.replace(
+            "__CLASSROOM_CODE__", json.dumps(classroom, ensure_ascii=False)
+        )
+        page = page.replace("</body>", live_script + "\n</body>")
+        self._send_bytes(200, "text/html; charset=utf-8", page.encode("utf-8"))
 
     def do_POST(self):
         global _position
@@ -71,6 +173,6 @@ class MealApiHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Meal API listening on http://{HOST}:{PORT}")
+    print(f"Meal server listening on http://{HOST}:{PORT}")
     print(f"Meal order: {', '.join(MEAL_ORDER)}")
     ThreadingHTTPServer((HOST, PORT), MealApiHandler).serve_forever()
